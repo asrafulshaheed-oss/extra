@@ -33,7 +33,7 @@ const { URL, fileURLToPath } = require('url');
 // ---------------------------------------------------------------------------
 // Constants (mirrors client.py)
 // ---------------------------------------------------------------------------
-const DEFAULT_IP = '192.168.0.113';
+const DEFAULT_IP = 'https://omarchy.taile8340b.ts.net';
 const DEFAULT_PORT = 4444;
 const RETRY_DELAY = 1;
 const CONNECT_TIMEOUT = 3;
