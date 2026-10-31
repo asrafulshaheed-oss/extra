@@ -1,23 +1,36 @@
 #!/bin/bash
 #
-# off.sh - "Movie Mode" for macOS (macOS 26 Tahoe ready, also works on Sonoma / Sequoia)
+# off.sh - "Movie Mode" for macOS (macOS 26 Tahoe ready, also Sonoma / Sequoia)
 #
 #   bash off.sh             -> kill ALL popups + notifications, turn ON all sharing
 #   bash off.sh --back      -> put popups/notifications back to normal (sharing stays ON)
 #   bash off.sh --status    -> show what is on / off right now
 #
 # What Movie Mode does:
-#   - kills every node / python "Allow" popup (firewall, Gatekeeper, quarantine, TCC privacy)
-#   - stops ALL notification banners - Notification Center is fully stopped
+#   - kills every node / python "Allow" popup:
+#       * finds EVERY node/python binary on your Mac (PATH, nvm, fnm, volta, asdf,
+#         pyenv, homebrew, system AND whatever is running right now via ps)
+#       * pre-approves Screen Recording, Accessibility, Full Disk Access, App
+#         Management, Apple Events, Local Network ... for all of them
+#       * removes dead "ghost" entries (old node versions) from the Settings list
+#   - stops ALL notification banners:
+#       * Notification Center stopped, AND the banner renderer (usernoted) stopped
+#         -> banners are physically impossible even when SIP protects NC
+#       * stops the "node can run in the background / Login Items" popups
+#       * classic + modern Do Not Disturb switched on
 #   - mutes alert sounds only (movie audio is untouched)
-#   - hides Control Center / Focus icons in the menu bar
+#   - hides menu bar icons: Control Center, Focus, Screen Mirroring (the purple
+#     one), Now Playing, Sound Recognition, Accessibility Shortcuts
 #   - turns ON every sharing service:
 #       File Sharing, Screen Sharing, Media Sharing, Content Caching,
 #       Bluetooth Sharing, Printer Sharing, Internet Sharing,
 #       Remote Login (SSH), Remote Management, Remote Application Scripting
 #
-# No reboot needed for anything. "--back" restores your normal settings.
-# Sharing services stay ON after --back (as requested).
+# Your Mac password is asked ONCE at the start of every "off" run (on purpose,
+# so you always see that the privileged part really runs).
+#
+# No reboot needed for anything. "--back" restores popups/notifications/sounds/
+# menu bar. Sharing services stay ON after --back (as requested).
 
 set -u
 
@@ -29,6 +42,8 @@ ASSERT_BAK="$HOME/.off.sh.assertions.bak"
 DND_DIR="$HOME/Library/DoNotDisturb/DB"
 NC_LABEL="com.apple.notificationcenterui"
 NC_PLIST="/System/Library/LaunchAgents/com.apple.notificationcenterui.plist"
+UNOTED_PLIST="/System/Library/LaunchAgents/com.apple.usernoted.plist"
+BTM_PLIST="/System/Library/LaunchAgents/com.apple.backgroundtaskmanagement.agent.plist"
 SFW="/usr/libexec/ApplicationFirewall/socketfilterfw"
 TCC_SYS="/Library/Application Support/com.apple.TCC/TCC.db"
 TCC_USR="$HOME/Library/Application Support/com.apple.TCC/TCC.db"
@@ -70,19 +85,100 @@ gk_state() {
   case "$s" in *disabled*) echo "off" ;; *) echo "on" ;; esac
 }
 nc_running() { /bin/launchctl print "gui/${UID_N}/${NC_LABEL}" >/dev/null 2>&1 && echo yes || echo no; }
+agent_running() { /bin/launchctl print "gui/${UID_N}/${1}" >/dev/null 2>&1 && echo yes || echo no; }
 alert_vol() {
   /usr/bin/osascript -e 'get volume settings' 2>/dev/null \
     | sed -n 's/.*alert volume:\([0-9][0-9]*\).*/\1/p' | tail -n 1
 }
 is_num() { printf '%s' "$1" | grep -qE '^[0-9]+$'; }
 
+# ---------- sudo ----------
+# need_sudo            -> prompt only if the cached session expired
+# need_sudo fresh      -> ALWAYS ask the password once (used by "off")
 need_sudo() {
-  sudo -n true 2>/dev/null && return 0
+  local fresh="${1:-}"
+  if [ "$fresh" = "fresh" ]; then
+    sudo -k 2>/dev/null || true           # forget cached password -> real prompt
+  fi
+  if sudo -n true 2>/dev/null; then
+    if [ "$fresh" = "fresh" ]; then
+      ok "Password accepted (asked fresh, as designed)"
+    else
+      ok "sudo session still valid (that is why no password was needed)"
+    fi
+    return 0
+  fi
   echo "Type your Mac password once (needed to change system settings):"
   if ! sudo -v; then bad "sudo access is required. Nothing was changed."; exit 1; fi
+  ok "Password accepted"
 }
 
-# ---------- TCC privacy pre-approval (best effort; SIP may block) ----------
+# ---------- launchd agent stop/start (user domain) ----------
+stop_agent() { # label plist -> 0 = stopped
+  local label="$1" plist="$2"
+  [ -f "$plist" ] || return 1
+  /bin/launchctl bootout "gui/${UID_N}/${label}" >/dev/null 2>&1 || true
+  sudo /bin/launchctl disable "gui/${UID_N}/${label}" >/dev/null 2>&1 || true
+  if /bin/launchctl print "gui/${UID_N}/${label}" >/dev/null 2>&1; then
+    sudo /bin/launchctl bootout "gui/${UID_N}/${label}" >/dev/null 2>&1 || true
+    /bin/launchctl print "gui/${UID_N}/${label}" >/dev/null 2>&1 && return 1
+    return 0
+  fi
+  return 0
+}
+
+start_agent() { # label plist -> 0 = running
+  local label="$1" plist="$2"
+  [ -f "$plist" ] || return 1
+  sudo /bin/launchctl enable "gui/${UID_N}/${label}" >/dev/null 2>&1 || true
+  /bin/launchctl bootstrap "gui/${UID_N}" "$plist" >/dev/null 2>&1 \
+    || sudo /bin/launchctl bootstrap "gui/${UID_N}" "$plist" >/dev/null 2>&1 || true
+  /bin/launchctl kickstart "gui/${UID_N}/${label}" >/dev/null 2>&1 || true
+  /bin/launchctl print "gui/${UID_N}/${label}" >/dev/null 2>&1
+}
+
+# ---------- find EVERY node / python binary on this Mac ----------
+collect_binaries() {
+  local b p
+  {
+    # 1) whatever is first in PATH
+    for b in node npx npm pnpm yarn bun deno tsx python python3; do
+      p="$(command -v "$b" 2>/dev/null || true)"
+      [ -n "$p" ] && printf '%s\n' "$p"
+    done
+    # 2) whatever is RUNNING right now (the exact binaries your AI agent uses)
+    ps axo comm= 2>/dev/null | grep -E '(^|/)(node|npx|npm|pnpm|yarn|bun|deno|tsx|python3?|electron)( -.*)?$' | grep '^/' || true
+    # 3) classic install locations
+    for p in /usr/local/bin/node /opt/homebrew/bin/node /usr/bin/node \
+             /usr/local/bin/npx /opt/homebrew/bin/npx \
+             /usr/local/bin/npm /opt/homebrew/bin/npm \
+             /usr/local/bin/python3 /opt/homebrew/bin/python3 /usr/bin/python3 \
+             /usr/local/bin/python /opt/homebrew/bin/python /usr/bin/python; do
+      [ -x "$p" ] && printf '%s\n' "$p"
+    done
+    # 4) version managers (nvm / fnm / volta / asdf / pyenv / pnpm home)
+    for p in "$HOME"/.nvm/versions/node/*/bin/node \
+             "$HOME"/.nvm/versions/node/*/bin/npx \
+             "$HOME"/.nvm/versions/node/*/bin/npm \
+             "$HOME"/.volta/bin/node \
+             "$HOME"/.local/share/fnm/aliases/default/bin/node \
+             "$HOME"/Library/"Application Support"/fnm/node-versions/*/installation/bin/node \
+             "$HOME"/.asdf/shims/node \
+             "$HOME"/.local/bin/node \
+             "$HOME"/Library/pnpm/node \
+             /usr/local/opt/node*/bin/node \
+             /opt/homebrew/opt/node*/bin/node \
+             "$HOME"/.pyenv/versions/*/bin/python3 \
+             "$HOME"/.pyenv/versions/*/bin/python \
+             "$HOME"/.pyenv/shims/python3 \
+             /usr/local/opt/python*/bin/python3 \
+             /opt/homebrew/opt/python*/bin/python3; do
+      [ -x "$p" ] && printf '%s\n' "$p"
+    done
+  } 2>/dev/null | sort -u | grep -v '^$' | head -n 60 || true
+}
+
+# ---------- TCC privacy pre-approval (best effort; SIP may block some) ----------
 tcc_attempt() { sudo /usr/bin/sqlite3 "$1" "$2" >/dev/null 2>&1; }
 
 tcc_grant() { # service client type [indirect-bundle-id]
@@ -107,8 +203,27 @@ tcc_grant() { # service client type [indirect-bundle-id]
   return 1
 }
 
+# remove "ghost" rows: permissions for binaries that no longer exist
+# (old node versions show up as dead "off" entries in the Settings list)
+tcc_clean_ghosts() {
+  local db c ghosts=0
+  for db in "$TCC_SYS" "$TCC_USR"; do
+    [ -e "$db" ] || continue
+    while IFS= read -r c; do
+      [ -n "$c" ] || continue
+      case "$c" in
+        /*) [ -e "$c" ] || { tcc_attempt "$db" "DELETE FROM access WHERE client='$c';"; ghosts=$((ghosts+1)); } ;;
+      esac
+    done <<EOF
+$(sudo /usr/bin/sqlite3 "$db" "SELECT client FROM access WHERE client_type=1;" 2>/dev/null || true)
+EOF
+  done
+  [ "$ghosts" -gt 0 ] && ok "Cleaned $ghosts dead permission entries (old node/python versions)"
+  return 0
+}
+
 grant_all_tcc() {
-  hdr "Pre-approving privacy permissions (Terminal, node, python...)"
+  hdr "Pre-approving permissions for EVERY node / python on this Mac"
   local apps=( "com.apple.Terminal" "com.googlecode.iterm2" "com.microsoft.VSCode" "com.todesktop.230313mzl4w4u92" )
   local svcs=( "kTCCServiceAccessibility" "kTCCServiceSystemPolicyAllFiles" "kTCCServiceScreenCapture"
                "kTCCServiceLocalNetwork" "kTCCServiceAppManagement" "kTCCServiceSystemPolicyAppBundles"
@@ -116,10 +231,16 @@ grant_all_tcc() {
                "kTCCServiceSystemPolicyDocumentsFolder" "kTCCServiceSystemPolicyRemovableVolumes"
                "kTCCServiceSystemPolicyNetworkVolumes" "kTCCServicePostEvent" "kTCCServiceListenEvent"
                "kTCCServiceNotifications" )
-  local binsvcs=( "kTCCServiceSystemPolicyAllFiles" "kTCCServiceLocalNetwork" "kTCCServiceAppManagement"
-                  "kTCCServiceSystemPolicyAppBundles" "kTCCServiceSystemPolicyRemovableVolumes"
-                  "kTCCServiceSystemPolicyNetworkVolumes" "kTCCServiceScreenCapture" "kTCCServicePostEvent" )
-  local a s b p granted=0 total=0
+  local binsvcs=( "kTCCServiceScreenCapture" "kTCCServiceSystemPolicyAllFiles" "kTCCServiceLocalNetwork"
+                  "kTCCServiceAppManagement" "kTCCServiceSystemPolicyAppBundles"
+                  "kTCCServiceSystemPolicyRemovableVolumes" "kTCCServiceSystemPolicyNetworkVolumes"
+                  "kTCCServicePostEvent" "kTCCServiceListenEvent" )
+  local a s b p granted=0 total=0 nbin=0
+  local bins
+  bins="$(collect_binaries)"
+  nbin="$(printf '%s\n' "$bins" | grep -c . || true)"
+
+  # terminal / editor apps
   for a in "${apps[@]}"; do
     for s in "${svcs[@]}"; do
       total=$((total+1)); tcc_grant "$s" "$a" 0 && granted=$((granted+1))
@@ -127,30 +248,28 @@ grant_all_tcc() {
     total=$((total+1)); tcc_grant kTCCServiceAppleEvents "$a" 0 com.apple.systemevents && granted=$((granted+1))
     total=$((total+1)); tcc_grant kTCCServiceAppleEvents "$a" 0 com.apple.finder && granted=$((granted+1))
   done
-  for b in node python3 python; do
-    p="$(command -v "$b" 2>/dev/null || true)"
-    [ -n "$p" ] || continue
+
+  # every node / python binary found on the machine
+  while IFS= read -r b; do
+    [ -n "$b" ] || continue
     for s in "${binsvcs[@]}"; do
-      total=$((total+1)); tcc_grant "$s" "$p" 1 && granted=$((granted+1))
+      total=$((total+1)); tcc_grant "$s" "$b" 1 && granted=$((granted+1))
     done
-    total=$((total+1)); tcc_grant kTCCServiceAppleEvents "$p" 1 com.apple.systemevents && granted=$((granted+1))
-    total=$((total+1)); tcc_grant kTCCServiceAppleEvents "$p" 1 com.apple.finder && granted=$((granted+1))
-  done
-  for p in /usr/local/bin/node /opt/homebrew/bin/node /usr/bin/python3 /opt/homebrew/bin/python3 /usr/local/bin/python3; do
-    [ -x "$p" ] || continue
-    for s in "${binsvcs[@]}"; do
-      total=$((total+1)); tcc_grant "$s" "$p" 1 && granted=$((granted+1))
-    done
-  done
+    total=$((total+1)); tcc_grant kTCCServiceAppleEvents "$b" 1 com.apple.systemevents && granted=$((granted+1))
+    total=$((total+1)); tcc_grant kTCCServiceAppleEvents "$b" 1 com.apple.finder && granted=$((granted+1))
+  done <<EOF
+$bins
+EOF
+
   sudo /usr/bin/pkill tccd >/dev/null 2>&1 || true
-  if [ "$granted" -gt 0 ]; then
-    ok "Pre-approved $granted/$total permission entries"
-    sub "Any that Apple SIP refused are remembered after ONE manual Allow click."
-  else
+  ok "Found $nbin node/python binaries; pre-approved $granted/$total permission entries"
+  if [ "$granted" -eq 0 ]; then
     bad "Apple SIP blocked direct edits (normal on a locked-down macOS)."
-    sub "If a first-time Allow box appears for node/python: click Allow once,"
-    sub "it is remembered forever after that."
+    sub "If a first-time Allow box appears: click Allow once, it is remembered forever."
+  else
+    sub "Any single entry Apple SIP refused is remembered after ONE manual Allow click."
   fi
+  tcc_clean_ghosts
 }
 
 # ---------- sharing services ----------
@@ -299,19 +418,15 @@ kill_node_python_popups() {
   else
     bad "Could not switch the firewall off"
   fi
-  # belt and braces: whitelist common binaries for when firewall comes back
-  local b p
-  for b in node python3 python; do
-    p="$(command -v "$b" 2>/dev/null || true)"
-    [ -n "$p" ] || continue
-    sudo "$SFW" --add "$p" >/dev/null 2>&1 || true
-    sudo "$SFW" --unblockapp "$p" >/dev/null 2>&1 || true
-  done
-  for p in /usr/local/bin/node /opt/homebrew/bin/node /usr/bin/python3 /opt/homebrew/bin/python3 /usr/local/bin/python3; do
-    [ -x "$p" ] || continue
-    sudo "$SFW" --add "$p" >/dev/null 2>&1 || true
-    sudo "$SFW" --unblockapp "$p" >/dev/null 2>&1 || true
-  done
+  # belt and braces: whitelist every node/python binary for when firewall returns
+  local b
+  while IFS= read -r b; do
+    [ -n "$b" ] || continue
+    sudo "$SFW" --add "$b" >/dev/null 2>&1 || true
+    sudo "$SFW" --unblockapp "$b" >/dev/null 2>&1 || true
+  done <<EOF
+$(collect_binaries)
+EOF
 
   # 2) Gatekeeper "cannot be opened / Allow Anyway" (npx, pip, downloaded tools)
   state_default gatekeeper "$(gk_state)"
@@ -332,7 +447,7 @@ kill_notifications() {
   /usr/bin/defaults write com.apple.notificationcenterui doNotDisturb -bool true
   /usr/bin/defaults write com.apple.notificationcenterui doNotDisturbDate "$(date -u -v+1d '+%Y-%m-%d %H:%M:%S +0000' 2>/dev/null || date -u '+%Y-%m-%d %H:%M:%S +0000')"
 
-  # b) modern Focus assertion (Monterey / Ventura / Sonoma / Sequoia / Tahoe)
+  # b) modern Focus assertion (Monterey ... Tahoe)
   mkdir -p "$DND_DIR" 2>/dev/null || true
   # back up the ORIGINAL assertions file once (never back up our own)
   if [ -f "$DND_DIR/Assertions.json" ] && [ ! -f "$ASSERT_BAK" ] && [ "$(state_get dndbak)" != "done" ]; then
@@ -342,24 +457,40 @@ kill_notifications() {
   printf '%s\n' '{ "data": [ { "storeID": 0, "assertionDetails": { "assertionIdentifiers": [ { "assertionIdentifier": "com.apple.donotdisturbd.nonqueued", "assertionAction": 3 } ] } } ] }' > "$DND_DIR/Assertions.json" 2>/dev/null || true
   /usr/bin/killall donotdisturbd >/dev/null 2>&1 || true
 
-  # c) full stop of Notification Center = banners physically impossible
-  if /bin/launchctl print "gui/${UID_N}/${NC_LABEL}" >/dev/null 2>&1; then
+  # c) full stop of Notification Center (also hides the menu bar clock)
+  if [ "$(nc_running)" = "yes" ]; then
     if /bin/launchctl bootout "gui/${UID_N}/${NC_LABEL}" >/dev/null 2>&1 \
+       || sudo /bin/launchctl bootout "gui/${UID_N}/${NC_LABEL}" >/dev/null 2>&1 \
        || /bin/launchctl unload -w "$NC_PLIST" >/dev/null 2>&1; then
-      ok "Notification Center: fully stopped (zero banners, guaranteed)"
-      state_set nc_off 1
-    else
       /usr/bin/killall NotificationCenter >/dev/null 2>&1 || true
-      ok "Do Not Disturb: ON (full stop was blocked by SIP)"
-      state_set nc_off 0
     fi
+  fi
+  if [ "$(nc_running)" = "yes" ]; then
+    ok "Do Not Disturb: ON (SIP stopped a full Notification Center kill)"
+    state_set nc_off 0
   else
-    ok "Notification Center: already stopped"
+    ok "Notification Center: fully stopped (clock hides too)"
     state_set nc_off 1
   fi
-  /usr/bin/killall usernoted >/dev/null 2>&1 || true   # clear already-queued banners
 
-  # d) alert sounds only - movie audio untouched
+  # d) THE HAMMER: stop usernoted - the process that RENDERS banner popups.
+  #    Even when SIP protects Notification Center, no usernoted = no banner.
+  if stop_agent com.apple.usernoted "$UNOTED_PLIST"; then
+    ok "Banner renderer (usernoted): STOPPED - popups physically cannot appear"
+  else
+    bad "Could not stop the banner renderer (usernoted)"
+  fi
+
+  # e) stop the "node can run in the background / Login Items" popups
+  if stop_agent com.apple.backgroundtaskmanagement.agent "$BTM_PLIST" \
+     || stop_agent com.apple.backgroundtaskmanagementagent "$BTM_PLIST"; then
+    ok "'App can run in the background' popups: STOPPED"
+  else
+    bad "Could not stop background-activity popups (agent not found)"
+  fi
+  /usr/bin/killall usernoted >/dev/null 2>&1 || true   # clear anything already queued
+
+  # f) alert sounds only - movie audio untouched
   local v; v="$(alert_vol)"
   if is_num "$v"; then state_default alertvol "$v"; fi
   if /usr/bin/osascript -e 'set volume alert volume 0' >/dev/null 2>&1; then
@@ -370,18 +501,21 @@ kill_notifications() {
   state_default beepvol "$( /usr/bin/defaults read NSGlobalDomain com.apple.sound.beep.volume 2>/dev/null || echo unset )"
   /usr/bin/defaults write NSGlobalDomain com.apple.sound.beep.volume -float 0
 
-  # e) dock bouncing
+  # g) dock bouncing
   state_default dockbounce "$( /usr/bin/defaults read com.apple.dock no-bouncing 2>/dev/null || echo unset )"
   /usr/bin/defaults write com.apple.dock no-bouncing -bool true
   /usr/bin/killall Dock >/dev/null 2>&1 || true
 
-  # f) menu bar: hide Control Center + Focus icons (the purple highlighted one)
-  state_default ccicon "$( /usr/bin/defaults -currentHost read com.apple.controlcenter 'NSStatusItem Visible ControlCenter' 2>/dev/null || echo unset )"
-  state_default focusicon "$( /usr/bin/defaults -currentHost read com.apple.controlcenter 'NSStatusItem Visible FocusModes' 2>/dev/null || echo unset )"
-  /usr/bin/defaults -currentHost write com.apple.controlcenter "NSStatusItem Visible ControlCenter" -bool false
-  /usr/bin/defaults -currentHost write com.apple.controlcenter "NSStatusItem Visible FocusModes" -bool false
+  # h) menu bar icons: Control Center, Focus, Screen Mirroring (the purple
+  #    computer-looking one), Now Playing, Sound Recognition, Accessibility
+  local k
+  for k in "ControlCenter" "FocusModes" "ScreenMirroring" "NowPlaying" "SoundRecognition" "AccessibilityShortcuts"; do
+    state_default "icon_${k}" "$( /usr/bin/defaults -currentHost read com.apple.controlcenter "NSStatusItem Visible ${k}" 2>/dev/null || echo unset )"
+    /usr/bin/defaults -currentHost write com.apple.controlcenter "NSStatusItem Visible ${k}" -bool false
+  done
   /usr/bin/killall ControlCenter >/dev/null 2>&1 || true
-  ok "Menu bar cleaned (Control Center + Focus icons hidden)"
+  /usr/bin/killall SystemUIServer >/dev/null 2>&1 || true
+  ok "Menu bar cleaned (purple Screen Mirroring icon + Control Center + Focus hidden)"
 }
 
 # ---------- restore ----------
@@ -422,10 +556,19 @@ restore_notifications() {
   fi
   /usr/bin/killall donotdisturbd >/dev/null 2>&1 || true
 
+  # banner renderer back
+  if start_agent com.apple.usernoted "$UNOTED_PLIST"; then
+    ok "Notification banners: back"
+  else
+    bad "Banner renderer not back yet - it also returns after a reboot"
+  fi
+  # background activity popups back
+  start_agent com.apple.backgroundtaskmanagement.agent "$BTM_PLIST" \
+    || start_agent com.apple.backgroundtaskmanagementagent "$BTM_PLIST" || true
+
+  # Notification Center (clock) back
   if [ "$(nc_running)" != "yes" ]; then
-    /bin/launchctl bootstrap "gui/${UID_N}" "$NC_PLIST" >/dev/null 2>&1 \
-      || sudo /bin/launchctl bootstrap "gui/${UID_N}" "$NC_PLIST" >/dev/null 2>&1 \
-      || /bin/launchctl load "$NC_PLIST" >/dev/null 2>&1 \
+    start_agent "$NC_LABEL" "$NC_PLIST" \
       || /usr/bin/open "/System/Library/CoreServices/NotificationCenter.app" >/dev/null 2>&1 \
       || true
   fi
@@ -458,27 +601,24 @@ restore_notifications() {
   fi
   /usr/bin/killall Dock >/dev/null 2>&1 || true
 
-  local c f
-  c="$(state_get ccicon)"
-  if [ "$c" = "unset" ] || [ -z "$c" ]; then
-    /usr/bin/defaults -currentHost delete com.apple.controlcenter "NSStatusItem Visible ControlCenter" >/dev/null 2>&1 || true
-  else
-    /usr/bin/defaults -currentHost write com.apple.controlcenter "NSStatusItem Visible ControlCenter" -bool "$c" >/dev/null 2>&1 || true
-  fi
-  f="$(state_get focusicon)"
-  if [ "$f" = "unset" ] || [ -z "$f" ]; then
-    /usr/bin/defaults -currentHost delete com.apple.controlcenter "NSStatusItem Visible FocusModes" >/dev/null 2>&1 || true
-  else
-    /usr/bin/defaults -currentHost write com.apple.controlcenter "NSStatusItem Visible FocusModes" -bool "$f" >/dev/null 2>&1 || true
-  fi
+  local k s
+  for k in "ControlCenter" "FocusModes" "ScreenMirroring" "NowPlaying" "SoundRecognition" "AccessibilityShortcuts"; do
+    s="$(state_get "icon_${k}")"
+    if [ "$s" = "unset" ] || [ -z "$s" ]; then
+      /usr/bin/defaults -currentHost delete com.apple.controlcenter "NSStatusItem Visible ${k}" >/dev/null 2>&1 || true
+    else
+      /usr/bin/defaults -currentHost write com.apple.controlcenter "NSStatusItem Visible ${k}" -bool "$s" >/dev/null 2>&1 || true
+    fi
+  done
   /usr/bin/killall ControlCenter >/dev/null 2>&1 || true
+  /usr/bin/killall SystemUIServer >/dev/null 2>&1 || true
   ok "Menu bar: restored"
 }
 
 # ---------- modes ----------
 do_off() {
   printf '\n%sMOVIE MODE: turning everything off%s\n' "$B" "$N"
-  need_sudo
+  need_sudo fresh   # ALWAYS show the password prompt once, every run
   kill_node_python_popups
   kill_notifications
   grant_all_tcc
@@ -492,10 +632,12 @@ do_off() {
   printf '%s\n' "=================================================="
   printf '%s\n' "  MOVIE MODE: ON - enjoy the movie"
   printf '%s\n' "--------------------------------------------------"
-  printf '%s\n' "  node / python popups ....... gone"
-  printf '%s\n' "  notifications & banners .... gone (clock hides too)"
+  printf '%s\n' "  node / python popups ....... gone (every binary"
+  printf '%s\n' "                               on this Mac covered)"
+  printf '%s\n' "  notifications & banners .... gone (renderer stopped)"
+  printf '%s\n' "  background-activity popups . gone"
   printf '%s\n' "  alert sounds ............... muted (movie audio OK)"
-  printf '%s\n' "  menu bar ................... cleaned"
+  printf '%s\n' "  menu bar ................... cleaned (purple icon gone)"
   printf '%s\n' "  sharing services ........... ALL ON (stay ON)"
   printf '%s\n' ""
   printf '%s\n' "  Back to normal, one line:"
@@ -537,6 +679,8 @@ do_status() {
   printf ' firewall             : %s\n' "$(fw_state)"
   printf ' gatekeeper           : %s\n' "$(gk_state)"
   printf ' notification center  : %s\n' "$(nc_running)"
+  printf ' banner renderer      : %s\n' "$(agent_running com.apple.usernoted)"
+  printf ' background popups    : %s\n' "$(agent_running com.apple.backgroundtaskmanagement.agent)"
   printf ' alert volume         : %s\n' "$(alert_vol)"
   printf ' -------------------------------\n'
   for l in com.openssh.sshd com.apple.screensharing com.apple.smbd com.apple.eppc com.apple.InternetSharing; do
