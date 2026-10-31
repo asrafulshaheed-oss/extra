@@ -6812,6 +6812,23 @@ GUI_CMD_LOCK = threading.Lock()
 GUI_CMD_COND = threading.Condition()   # wakes the browser-command dispatcher
 
 
+def _gui_term_text(text):
+    """Sanitize raw shell output for the browser terminal model.
+
+    Colour and OSC escapes are dropped, but the two redraw escapes shells
+    actually use are re-injected as single control sentinels the page
+    understands: \\x01 = EL (cut the line at the cursor), \\x02 = ED (clear
+    the screen).  \\r, \\b and \\t survive verbatim - they are what makes
+    echo, backspace and column-aligned output behave like a real terminal
+    instead of one div per network chunk."""
+    if '\x1b' in text:
+        for el in ('\x1b[0K', '\x1b[K'):
+            text = text.replace(el, '\x01')
+        for ed in ('\x1b[0J', '\x1b[J', '\x1b[1J', '\x1b[2J'):
+            text = text.replace(ed, '\x02')
+    return _gui_ansi_strip(text).replace('\x00', '')
+
+
 def _gui_ansi_strip(text):
     """Remove ANSI/OSC escape sequences so browser text stays readable."""
     if '\x1b' not in text:
@@ -6861,6 +6878,7 @@ class GuiShell(object):
         self.conn = None
         self.client_os = ''
         self.out = []
+        self._pend = b''                # a UTF-8 character split mid-chunk
         self.version = 1
 
     def snapshot(self):
@@ -6871,19 +6889,47 @@ class GuiShell(object):
                     'version': self.version}
 
     def write_out(self, data):
-        try:
-            text = bytes(data).decode('utf-8', 'replace')
-        except Exception:
-            return
-        text = _gui_ansi_strip(text).replace('\r\n', '\n').replace('\r', '\n')
-        if not text:
-            return
-        with self.lock:
-            self.out.append(text)
-            if len(self.out) > 800:
-                del self.out[:len(self.out) - 800]
-            self.version += 1
-        self.dashboard.publish({'kind': 'shell_out', 'data': text})
+        """Shell output -> the browser terminal.
+
+        The text keeps its \r / \b / \t control characters: the page's
+        terminal model needs them to echo keystrokes on one line, fix typos
+        and align columns instead of stacking every chunk on its own line.
+        A multi-byte character split across two recv() chunks is held back
+        until its tail arrives, so UTF-8 never turns into '?' pairs."""
+        data = bytes(data)
+        if self._pend:
+            data = self._pend + data
+            self._pend = b''
+        while data:
+            try:
+                text = data.decode('utf-8')
+                data = b''
+            except UnicodeDecodeError as exc:
+                start = exc.start
+                if not start and len(data) <= 3:
+                    self._pend = data          # a character's first bytes only
+                    return
+                if start and start >= len(data) - 3:
+                    text = data[:start].decode('utf-8', 'replace')
+                    self._pend = data[start:]  # truncated tail: wait for more
+                    data = b''
+                    if len(self._pend) > 4:    # garbage must never wedge us
+                        text += self._pend.decode('utf-8', 'replace')
+                        self._pend = b''
+                else:
+                    text = data[:start + 1].decode('utf-8', 'replace')
+                    data = data[start + 1:]
+            if not text:
+                continue
+            text = _gui_term_text(text)
+            if not text:
+                continue
+            with self.lock:
+                self.out.append(text)
+                if len(self.out) > 800:
+                    del self.out[:len(self.out) - 800]
+                self.version += 1
+            self.dashboard.publish({'kind': 'shell_out', 'data': text})
 
     def write_in(self, data):
         """Keystrokes from the browser towards the client's PTY."""
@@ -6902,11 +6948,13 @@ class GuiShell(object):
             self.conn = conn
             self.client_os = client_os or ''
             self.out = []
+            self._pend = b''
             self.version += 1
 
     def detach(self):
         with self.lock:
             self.conn = None
+            self._pend = b''
             self.version += 1
 
     def stop(self):
@@ -9022,7 +9070,15 @@ button.wide { width: 100%; text-align: left; margin-bottom: 7px; }
 input, select { flex: 1; background: #0b1117; border: 1px solid var(--edge2); color: #e6edf3;
   border-radius: 7px; padding: 8px 11px; font: inherit; min-width: 0; }
 input:focus { outline: none; border-color: #2e6e54; }
-input[type=checkbox]{ flex:0; min-width:0; }
+input[type=checkbox]{ flex:0 0 auto; min-width:0; width:15px; height:15px; margin:0; padding:0;
+  -webkit-appearance:none; appearance:none; background:#0b1117;
+  border:1px solid #2c3a4d; border-radius:4px; cursor:pointer; }
+input[type=checkbox]:hover{ border-color:#3a5570; }
+input[type=checkbox]:checked{ background:#17402f; border-color:#2e6e54;
+  background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath d='M3 8.5 6.5 12 13 4.5' fill='none' stroke='%2358d5a9' stroke-width='2.5' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+  background-size:12px 12px; background-position:center; background-repeat:no-repeat; }
+input[type=checkbox]:disabled{ opacity:.4; cursor:default; }
+input[type=checkbox]:disabled:checked{ opacity:.6; }
 .spacer { flex: 1; }
 .pill { font-size: 11.5px; padding: 2px 9px; border-radius: 20px;
   background: var(--edge); color: #8fa1b3; white-space: nowrap; }
@@ -9039,6 +9095,7 @@ input[type=checkbox]{ flex:0; min-width:0; }
 .term { background: #080d12; border: 1px solid #1a232e; border-radius: 8px;
   padding: 10px 12px; overflow-y: auto; white-space: pre-wrap; word-break: break-word;
   font: 12.5px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+.term > div { min-height: 1.5em; }
 #term { height: 460px; outline: none; cursor: text; }
 #term.focus { border-color: #2e6e54; }
 #log { height: 430px; }
@@ -9330,14 +9387,88 @@ _GUI_PAGE_HTML += r"""<script>
   function nearBottom(el) {
     return el.scrollHeight - el.scrollTop - el.clientHeight < 80;
   }
-  function appendText(el, text) {
-    if (!text) return;
+  // ---------- Shell tab terminal --------------------------------------------
+  // A remote shell redraws: it echoes each keystroke, rewinds the line with
+  // \r, fixes typos with \b and breaks lines with \n.  Rendering every
+  // network chunk as its own div stacked the echoed letters vertically (one
+  // per chunk) - the "l / s" GUI bug.  The terminal keeps a proper line
+  // model instead and updates the last line in place.
+  var TERM = { lines: [''], cursor: 0 };
+  function termReset() {
+    TERM.lines = [''];
+    TERM.cursor = 0;
+    var el = $('term');
+    el.innerHTML = '';
+    el.scrollTop = 0;
+  }
+  function termPaint() {
+    var el = $('term');
+    var lines = TERM.lines;
     var stick = nearBottom(el);
-    var div = document.createElement('div');
-    div.textContent = text;
-    el.appendChild(div);
-    while (el.childNodes.length > 3000) el.removeChild(el.firstChild);
+    while (el.childNodes.length > lines.length) {
+      el.removeChild(el.firstChild);
+    }
+    while (el.childNodes.length < lines.length) {
+      el.appendChild(document.createElement('div'));
+    }
+    // Only the tail can have changed; syncing a few lines keeps typing cheap.
+    var from = Math.max(0, lines.length - 4);
+    for (var i = from; i < lines.length; i++) {
+      el.childNodes[i].textContent = lines[i];
+    }
     if (stick) el.scrollTop = el.scrollHeight;
+  }
+  function termWrite(text) {
+    if (!text) return;
+    var lines = TERM.lines;
+    var line = lines[lines.length - 1];
+    var cursor = TERM.cursor;
+    if (line === undefined) { line = ''; lines.push(''); }
+    for (var i = 0; i < text.length; i++) {
+      var ch = text.charAt(i);
+      if (ch === '\n') {
+        lines[lines.length - 1] = line;
+        lines.push('');
+        line = '';
+        cursor = 0;
+        continue;
+      }
+      if (ch === '\r') { cursor = 0; continue; }
+      if (ch === '\b') { if (cursor > 0) cursor -= 1; continue; }
+      if (ch === '\x01') {                     // EL: cut the line at the cursor
+        line = line.slice(0, cursor);
+        continue;
+      }
+      if (ch === '\x02') {                     // ED: clear the screen
+        lines.length = 1;
+        lines[0] = '';
+        line = '';
+        cursor = 0;
+        $('term').innerHTML = '';
+        continue;
+      }
+      if (ch === '\t') {
+        var stop = 8 - (cursor % 8);
+        while (stop-- > 0) {
+          line = line.slice(0, cursor) + ' '
+            + (cursor < line.length ? line.slice(cursor + 1) : '');
+          cursor += 1;
+        }
+        continue;
+      }
+      if (ch < ' ') continue;
+      line = line.slice(0, cursor) + ch
+        + (cursor < line.length ? line.slice(cursor + 1) : '');
+      cursor += 1;
+    }
+    lines[lines.length - 1] = line;
+    TERM.cursor = cursor;
+    while (lines.length > 2000) {
+      lines.shift();
+      var first = $('term').firstChild;
+      if (first) $('term').removeChild(first);
+    }
+    termPaint();
   }
   var noteTimer = null;
   function note(text) {
@@ -9491,8 +9622,8 @@ _GUI_PAGE_HTML += r"""<script>
     $('shsend').disabled = !active;
     if (active) {
       if (shell.version !== S.shellVersion && !$('term').dataset.seeded) {
-        $('term').innerHTML = '';
-        appendText($('term'), (shell.tail || []).join(''));
+        termReset();
+        termWrite((shell.tail || []).join(''));
         $('term').dataset.seeded = '1';
       }
       S.shellVersion = shell.version;
@@ -9887,9 +10018,27 @@ _GUI_PAGE_HTML += r"""
     Delete: '\x1b[3~', PageUp: '\x1b[5~', PageDown: '\x1b[6~',
     Insert: '\x1b[2~'
   };
+  // Keystrokes must reach the client in exactly the order they were typed.
+  // Separate fetch() calls can race on pooled connections (a fast "echo hi"
+  // once arrived as "ehco hi"), so keys are batched for a few milliseconds
+  // and every batch is chained behind the previous one.
+  var shellPend = '';
+  var shellTimer = null;
+  var shellChain = Promise.resolve();
   function shellSend(data) {
     if (!data) return;
-    post('/api/shell/input', { data: data });
+    shellPend += data;
+    if (shellTimer === null) {
+      shellTimer = setTimeout(function () {
+        shellTimer = null;
+        var batch = shellPend;
+        shellPend = '';
+        shellChain = shellChain.then(function () {
+          return post('/api/shell/input', { data: batch })
+            .catch(function () {});
+        });
+      }, 12);
+    }
   }
   $('term').addEventListener('keydown', function (ev) {
     if (!$('term').dataset.seeded && !$('shellstate').className.match('on')) return;
@@ -9942,7 +10091,7 @@ _GUI_PAGE_HTML += r"""
     shellSend(value + '\r');
   });
   $('shellstart').addEventListener('click', function () {
-    $('term').innerHTML = '';
+    termReset();
     post('/api/shell/start', { rows: 34, cols: 120 }).then(function (r) {
       if (r && r.ok) {
         toast('Shell opening on the active session…');
@@ -10147,7 +10296,7 @@ _GUI_PAGE_HTML += r"""
     } catch (err) {}
   });
   es.addEventListener('shell_out', function (e) {
-    try { appendText($('term'), JSON.parse(e.data).data); } catch (err) {}
+    try { termWrite(JSON.parse(e.data).data); } catch (err) {}
   });
   es.addEventListener('shot', function () { refreshSoon(); });
   es.addEventListener('open_screen', function () {

@@ -33,7 +33,7 @@ const { URL, fileURLToPath } = require('url');
 // ---------------------------------------------------------------------------
 // Constants (mirrors client.py)
 // ---------------------------------------------------------------------------
-const DEFAULT_IP = 'https://omarchy.taile8340b.ts.net';
+const DEFAULT_IP = '192.168.0.113';
 const DEFAULT_PORT = 4444;
 const RETRY_DELAY = 1;
 const CONNECT_TIMEOUT = 3;
@@ -1544,6 +1544,10 @@ function decodeJpegScan(buffer, scanStart, ctx) {
     c.pw = mcuCols * 8 * c.h;
     c.ph = mcuRows * 8 * c.v;
     c.plane = new Uint8Array(c.pw * c.ph);
+    // A scan that stops early (damaged file, truncated transfer) must
+    // degrade to neutral grey.  All-zero YCbCr planes would decode to a
+    // solid green frame - the exact macOS green-screen bug.
+    c.plane.fill(128);
   }
 
   // Entropy-coded bit reader with 0xFF00 stuffing and restart markers.  The
@@ -1561,8 +1565,11 @@ function decodeJpegScan(buffer, scanStart, ctx) {
         const m = bp < buffer.length ? buffer[bp] : 0;
         if (m === 0x00) {
           bp += 1;                            // stuffed byte
+        } else if (m >= 0xd0 && m <= 0xd7) {
+          bp -= 1;                            // restart marker: the MCU loop
+          break;                              // consumes it; never ends the scan
         } else {
-          bp -= 1;                            // restart/EOI: leave it in place
+          bp -= 1;                            // EOI/another marker: leave it
           ended = true;
           break;
         }
@@ -1607,6 +1614,7 @@ function decodeJpegScan(buffer, scanStart, ctx) {
         if (bp + 1 < buffer.length && buffer[bp] === 0xff
           && buffer[bp + 1] >= 0xd0 && buffer[bp + 1] <= 0xd7) {
           bp += 2;
+          ended = false;          // a live restart marker revives the scan
         }
         for (const c of comps) c.pred = 0;
       }
@@ -1763,8 +1771,33 @@ function decodeBmp(data) {
   const bits = data.readUInt16LE(28);
   const compression = data.readUInt32LE(30);
   if (width <= 0 || rawHeight === 0) throw new Error('invalid BMP dimensions');
-  if (compression !== 0) throw new Error('compressed BMP is not supported');
+  if (compression !== 0 && compression !== 3) {
+    throw new Error('compressed BMP is not supported');
+  }
   if (bits !== 24 && bits !== 32) throw new Error('unsupported BMP bit depth: ' + bits);
+  if (compression === 3 && bits !== 32) {
+    throw new Error('BI_BITFIELDS needs a 32-bit BMP');
+  }
+  // BI_BITFIELDS: the R/G/B masks live at file offset 54 - inside the header
+  // for the V4/V5 forms, right after the 40-byte core header for the classic
+  // masked form.  Missing or zero masks fall back to the default BGRX layout.
+  let rMask = 0, gMask = 0, bMask = 0;
+  if (compression === 3) {
+    if (54 + 12 <= data.length && (headerSize >= 52 || pixelOffset >= 54 + 12)) {
+      rMask = data.readUInt32LE(54);
+      gMask = data.readUInt32LE(58);
+      bMask = data.readUInt32LE(62);
+    }
+    if (!rMask && !gMask && !bMask) {
+      rMask = 0x00ff0000; gMask = 0x0000ff00; bMask = 0x000000ff;
+    }
+  }
+  const maskInfo = (mask) => {
+    let shift = 0;
+    while (mask && (mask & 1) === 0) { mask >>>= 1; shift += 1; }
+    return { shift, scale: mask ? 255 / mask : 0 };
+  };
+  const ri = maskInfo(rMask), gi = maskInfo(gMask), bi = maskInfo(bMask);
   const height = Math.abs(rawHeight);
   const topDown = rawHeight < 0;
   const stride = Math.floor((width * bits + 31) / 32) * 4;
@@ -1777,9 +1810,16 @@ function decodeBmp(data) {
     let dst = y * width * 3;
     for (let x = 0; x < width; x++) {
       const src = srcRow + x * bytes;
-      out[dst++] = data[src + 2];             // BGR(A) -> RGB
-      out[dst++] = data[src + 1];
-      out[dst++] = data[src];
+      if (compression === 3) {
+        const px = data.readUInt32LE(src);
+        out[dst++] = Math.round(((px & rMask) >>> ri.shift) * ri.scale);
+        out[dst++] = Math.round(((px & gMask) >>> gi.shift) * gi.scale);
+        out[dst++] = Math.round(((px & bMask) >>> bi.shift) * bi.scale);
+      } else {
+        out[dst++] = data[src + 2];           // BGR(A) -> RGB
+        out[dst++] = data[src + 1];
+        out[dst++] = data[src];
+      }
     }
   }
   return { width, height, data: out };
