@@ -51,7 +51,7 @@ http = 'http'
 https = 'https'
 connection_type = auto         # <- auto / https / http / tcp
 
-DEFAULT_IP = 'https://bbvdi-163-53-148-203.run.pinggy-free.link'
+DEFAULT_IP = 'tcp://nyitr-163-53-148-203.run.pinggy-free.link:33449'
 DEFAULT_PORT = 4444
 RETRY_DELAY = 1               # seconds between reconnect attempts
 CONNECT_TIMEOUT = 3           # seconds a TCP connect may take before we retry
