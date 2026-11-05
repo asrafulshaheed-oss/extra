@@ -403,10 +403,28 @@ def _android_wake_lock(enable):
 
 
 def _shell_executable():
-    """Android has no /bin/sh in the Termux root; use Termux's own sh.
+    """Pick the shell used by the interactive PTY bridge.
+
+    Android has no /bin/sh in the Termux root, so Termux's own sh is used.
+    On macOS the SHELL variable can be missing (a client started from the
+    Finder, a LaunchAgent or a plain `launchctl` job has no shell context),
+    and iOS only offers /bin/sh on jailbroken devices - both get an ordered
+    fallback chain instead of a hardcoded /bin/bash that may not exist.
     Everywhere else None keeps Python's default /bin/sh exactly as before."""
     if is_android():
         return shutil.which('sh') or '/system/bin/sh'
+    if is_ios():
+        for candidate in ('/bin/sh', '/bin/bash', '/bin/zsh'):
+            if os.path.exists(candidate):
+                return candidate
+        return shutil.which('sh') or '/bin/sh'
+    if is_macos():
+        candidates = [os.environ.get('SHELL') or '', '/bin/zsh',
+                      '/bin/bash', '/bin/sh']
+        for candidate in candidates:
+            if candidate and os.path.exists(candidate):
+                return candidate
+        return shutil.which('sh') or '/bin/sh'
     return None
 
 
@@ -3060,69 +3078,199 @@ def _reap_pty_child(pid, grace=2.0):
         deadline = time.time() + 1.0
 
 
-def _shell_child_setup():
-    """Decide the shell and its environment in the PARENT, before pty.fork().
+def _shell_pipe(sock, rows, cols):
+    """Line-oriented shell fallback for systems without a usable PTY (iOS,
+    locked-down sandboxes, a missing /dev/ptmx).
 
-    Between fork() and exec() a child may only use raw syscalls.  On macOS and
-    iOS almost every libc call that touches the heap can deadlock against a
-    malloc lock held by another thread at fork time (this client runs many
-    threads), so the old child code - termios wrappers, os.environ writes
-    (putenv), os.path.exists and execvp's PATH search - could hang there and
-    leave the controller's shell connected but silent.  Everything is decided
-    here instead and the child only calls os.execve(), which is exec-safe.
-    """
-    env = dict(os.environ)
-    env['TERM'] = 'dumb'
-    env.pop('COLORTERM', None)
-    # Interactive Python helpers (input(), print(prompt, end='')) flush
-    # their prompt even when a Windows pipe fallback makes stdout a pipe.
-    env['PYTHONUNBUFFERED'] = '1'
-    env.setdefault('PYTHONIOENCODING', 'utf-8')
-    shell = _shell_executable() or env.get('SHELL') or '/bin/bash'
+    The controller's terminal is raw, so Enter arrives as a bare '\\r'.  A
+    shell reading from a *pipe* (not a terminal) does not strip '\\r' - it
+    would try to execute "cmd\\r" and answer "command not found: ^M", which
+    is exactly the macOS bug.  Every submitted line is therefore echoed
+    locally and forwarded with a single trailing '\\n' and no '\\r'."""
+    import subprocess
+    shell = _shell_executable() or os.environ.get('SHELL') or '/bin/sh'
     if not os.path.exists(shell):
-        shell = '/bin/bash' if os.path.exists('/bin/bash') else '/bin/sh'
-    return shell, env
+        shell = '/bin/sh'
+    popen_kwargs = {}
+    if os.name != 'nt':
+        # Own session -> Ctrl+C can hit the shell's group without ever
+        # touching the client process itself.
+        popen_kwargs['start_new_session'] = True
+    try:
+        proc = subprocess.Popen(
+            [shell, '-i'], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT, bufsize=0, env=_shell_child_env(),
+            **popen_kwargs)
+    except OSError as exc:
+        _shell_notice(sock, 'could not start {}: {}'.format(shell, exc))
+        return
+    proc_stdin = proc.stdin
+    proc_stdout = proc.stdout
+    line = []
+    last_was_cr = False
+    try:
+        while True:
+            try:
+                readable, _w, _x = select.select([sock, proc_stdout], [], [],
+                                                 0.2)
+            except (OSError, ValueError):
+                break
+            if proc_stdout in readable:
+                try:
+                    data = os.read(proc_stdout.fileno(), 65536)
+                except (OSError, ValueError):
+                    data = b''
+                if not data:
+                    break                       # the shell exited
+                if not _send_shell_output(sock, data):
+                    break                       # the controller is gone
+                continue
+            if sock not in readable:
+                if _shell_pipe_dead(proc):
+                    break
+                continue
+            try:
+                data = sock.recv(65536)
+            except OSError:
+                break
+            if not data:
+                break
+            for value in data:
+                char = bytes((value,))
+                if char in (b'\r', b'\n'):
+                    if char == b'\n' and last_was_cr:
+                        last_was_cr = False     # CRLF counts as one Enter
+                        continue
+                    last_was_cr = (char == b'\r')
+                    command = b''.join(line)
+                    line = []
+                    if not _send_shell_output(sock, b'\r\n'):
+                        break
+                    try:
+                        proc_stdin.write(command + b'\n')
+                        proc_stdin.flush()
+                    except (OSError, ValueError):
+                        break
+                    continue
+                last_was_cr = False
+                if char in (b'\x7f', b'\b'):
+                    if line:
+                        line.pop()
+                        _send_shell_output(sock, b'\b \b')
+                    continue
+                if char == b'\x03':             # Ctrl+C
+                    line = []
+                    _send_shell_output(sock, b'^C\r\n')
+                    if os.name != 'nt':
+                        try:
+                            os.killpg(proc.pid, signal.SIGINT)
+                        except (OSError, AttributeError):
+                            pass
+                    continue
+                if char == b'\x04':             # Ctrl+D
+                    if line:
+                        command = b''.join(line)
+                        line = []
+                        _send_shell_output(sock, b'\r\n')
+                        try:
+                            proc_stdin.write(command + b'\n')
+                            proc_stdin.flush()
+                        except (OSError, ValueError):
+                            break
+                    else:
+                        try:
+                            proc_stdin.close()
+                        except (OSError, ValueError):
+                            pass
+                    continue
+                if value < 0x20 and char != b'\t':
+                    continue                    # other control bytes: ignore
+                line.append(char)
+                _send_shell_output(sock, char)
+    finally:
+        try:
+            proc_stdin.close()
+        except (OSError, ValueError):
+            pass
+        if os.name != 'nt':
+            for sig in (signal.SIGHUP, signal.SIGKILL):
+                try:
+                    os.killpg(proc.pid, sig)
+                except (OSError, AttributeError):
+                    break
+                try:
+                    proc.wait(timeout=1.0)
+                    break
+                except Exception:
+                    pass
+        else:
+            try:
+                proc.kill()
+            except OSError:
+                pass
+            try:
+                proc.wait(timeout=1.0)
+            except Exception:
+                pass
+
+
+def _shell_pipe_dead(proc):
+    """True once the fallback shell process has clearly exited."""
+    return proc.poll() is not None
 
 
 def _shell_unix(sock, rows, cols):
     """Bridge a real interactive shell (PTY) to the controller's socket."""
-    import fcntl
-    import pty
-    import signal
-    import termios
-
-    shell, shell_env = _shell_child_setup()
     try:
+        import fcntl
+        import pty
+        import signal
+        import termios
+
         pid, master_fd = pty.fork()
-    except OSError as e:
-        # Stock iOS and hardened sandboxes deny fork()/forkpty() outright.
-        # The shell channel then used to die silently; a line-oriented pipe
-        # shell keeps it usable instead (same idea as the Windows fallback).
-        try:
-            _shell_notice(sock, 'No PTY available here ({}); '
-                                'using a line-oriented shell'.format(e))
-        except Exception:
-            pass
-        _shell_posix_pipes(sock, shell, shell_env)
-        return
+    except Exception as exc:
+        # iOS and locked-down sandboxes have no usable PTY.  Degrade to the
+        # line-oriented bridge instead of killing the whole shell session
+        # (the old code let the error escape and 'shell' just died there).
+        _shell_notice(sock, 'no usable PTY here ({}); running a line-oriented '
+                            'shell'.format(exc))
+        return _shell_pipe(sock, rows, cols)
     if pid == 0:
-        # Child: drop the socket, then exec the shell chosen above.
-        # Only raw syscalls may run between fork() and exec(): on macOS/iOS
-        # anything that touches the heap can deadlock (see _shell_child_setup).
-        # A freshly forked PTY already has ICRNL/ICANON/ECHO/ISIG on, and
-        # TERM=dumb ships inside shell_env, so no more setup is needed here.
+        # Child: drop the socket, make the PTY a sane terminal, exec a shell.
         try:
             os.close(sock.fileno())
         except OSError:
             pass
         try:
-            os.execve(shell, [shell, '-i'], shell_env)
-        except OSError:
+            attrs = termios.tcgetattr(0)
+            attrs[0] |= termios.ICRNL
+            attrs[3] |= termios.ICANON | termios.ECHO | termios.ISIG
+            termios.tcsetattr(0, termios.TCSANOW, attrs)
+        except Exception:
             pass
+        # The controller is a plain text bridge, not a real terminal: it does
+        # not answer ZLE/readline feature queries (kitty keyboard, OSC 11,
+        # XTGETTCAP), so bash/zsh with TERM=xterm-* sat waiting for replies and
+        # never processed a single command. A dumb terminal always works; the
+        # shell still gets a prompt, echo, backspace and job control.
+        os.environ['TERM'] = 'dumb'
+        os.environ.pop('COLORTERM', None)
+        # Interactive Python helpers (input(), print(prompt, end='')) flush
+        # their prompt even when a Windows pipe fallback makes stdout a pipe.
+        os.environ['PYTHONUNBUFFERED'] = '1'
+        os.environ.setdefault('PYTHONIOENCODING', 'utf-8')
+        shell = _shell_executable() or os.environ.get('SHELL') or '/bin/bash'
+        if not os.path.exists(shell):
+            shell = '/bin/bash' if os.path.exists('/bin/bash') else '/bin/sh'
         try:
-            os.execve('/bin/sh', ['/bin/sh', '-i'], shell_env)
+            os.execvp(shell, [shell, '-i'])
         except OSError:
-            pass
+            # Last resort, and never return into the client's code from this
+            # forked child (that would duplicate the whole process).
+            try:
+                os.execvp('/bin/sh', ['/bin/sh', '-i'])
+            except OSError:
+                pass
         os._exit(1)
 
     if rows > 0 and cols > 0:
@@ -3201,168 +3349,6 @@ def _shell_unix(sock, rows, cols):
         except OSError:
             pass
         _reap_pty_child(pid)            # bounded: never blocks forever on a stuck shell
-
-
-def _shell_posix_pipes(sock, shell, shell_env):
-    """Line-oriented last-resort shell when no PTY can be forked (stock iOS,
-    hardened sandboxes, fork-restricted containers).
-
-    Same protocol as the Windows pipe fallback: typed characters are echoed
-    locally, complete lines are submitted on Enter, and the child's output is
-    streamed as it arrives.  Ctrl+C reaches the child as a real SIGINT (this
-    is POSIX), and Ctrl+D on an empty line closes stdin so the shell exits.
-    """
-    try:
-        proc = subprocess.Popen([shell, '-i'],
-                                stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                stderr=subprocess.STDOUT, bufsize=0,
-                                close_fds=True, start_new_session=True,
-                                env=shell_env)
-    except OSError as e:
-        _shell_notice(sock, 'no shell could be started here ({})'.format(e))
-        return
-
-    send_lock = threading.Lock()
-
-    def send_raw(data):
-        with send_lock:
-            return _send_shell_output(sock, data)
-
-    stop = threading.Event()
-
-    def pump():
-        try:
-            while not stop.is_set():
-                chunk = os.read(proc.stdout.fileno(), 65536)
-                if not chunk:
-                    break
-                send_raw(chunk)
-        except OSError:
-            pass
-        finally:
-            stop.set()
-            try:
-                sock.shutdown(socket.SHUT_WR)
-            except OSError:
-                pass
-
-    threading.Thread(target=pump, name='pipe-shell-output', daemon=True).start()
-
-    input_queue = queue.Queue(maxsize=64)
-    dropped = [0]
-
-    def input_writer():
-        while not stop.is_set():
-            try:
-                command = input_queue.get(timeout=0.2)
-            except queue.Empty:
-                continue
-            if command is None:
-                return
-            try:
-                proc.stdin.write((command + '\n').encode('utf-8', 'replace'))
-                proc.stdin.flush()
-            except (OSError, ValueError):
-                stop.set()
-                return
-
-    writer_thread = threading.Thread(target=input_writer,
-                                     name='pipe-shell-input', daemon=True)
-    writer_thread.start()
-
-    def echo(text):
-        try:
-            send_raw(text.encode('utf-8', 'replace'))
-        except OSError:
-            stop.set()
-
-    decoder = codecs.getincrementaldecoder('utf-8')('replace')
-    pending_escape = ''
-    line = []
-    last_was_cr = False
-    try:
-        while not stop.is_set():
-            try:
-                data = sock.recv(65536)
-            except (OSError, BrokenPipeError):
-                break
-            if not data:
-                break
-            text, pending_escape = _filter_shell_keys(
-                pending_escape + decoder.decode(data))
-            for char in text:
-                if char == '\n' and last_was_cr:
-                    last_was_cr = False
-                    continue
-                last_was_cr = char == '\r'
-                if char in ('\r', '\n'):
-                    command = ''.join(line)
-                    line = []
-                    echo('\r\n')
-                    try:
-                        input_queue.put_nowait(command)
-                    except queue.Full:
-                        dropped[0] += 1
-                        echo('\r\n[client] input queue full; line dropped\r\n')
-                    continue
-                if char in ('\x7f', '\x08'):
-                    if line:
-                        line.pop()
-                        echo('\b \b')
-                    continue
-                if char == '\x03':
-                    line = []
-                    echo('^C\r\n')
-                    try:
-                        os.killpg(proc.pid, signal.SIGINT)
-                    except OSError:
-                        try:
-                            proc.send_signal(signal.SIGINT)
-                        except (OSError, ValueError, AttributeError):
-                            pass
-                    continue
-                if char == '\x04':
-                    # Ctrl+D on an empty line: hand the shell EOF so it exits.
-                    if not line:
-                        stop.set()
-                        break
-                    continue
-                if char == '\t':
-                    # No readline over a pipe; keep tabs visible as spaces.
-                    line.extend('    ')
-                    echo('    ')
-                    continue
-                if char < ' ':
-                    continue
-                line.append(char)
-                echo(char)
-    except (OSError, BrokenPipeError):
-        pass
-    finally:
-        stop.set()
-        try:
-            proc.stdin.close()
-        except (OSError, ValueError):
-            pass
-        try:
-            input_queue.put_nowait(None)
-        except queue.Full:
-            pass
-        try:
-            writer_thread.join(0.5)
-        except Exception:
-            pass
-        try:
-            proc.terminate()
-        except Exception:
-            pass
-        try:
-            proc.wait(timeout=1.0)
-        except Exception:
-            try:
-                proc.kill()
-            except Exception:
-                pass
 
 
 def _shell_child_env():
@@ -3926,8 +3912,14 @@ def _shell_windows_conpty(sock, rows, cols):
             if not data:
                 break
             writer.send(data)
-    except Exception:
-        pass
+    except Exception as exc:
+        # A silent death here left the controller's shell connected but empty
+        # ("shows nothing"); report it through the shell channel instead.
+        try:
+            _shell_notice(sock, 'ConPTY bridge stopped unexpectedly: {}'.format(
+                str(exc) or exc.__class__.__name__))
+        except Exception:
+            pass
     finally:
         stop.set()
         try:
@@ -4143,12 +4135,17 @@ def _shell_windows_pipes(sock):
         startupinfo.dwFlags |= getattr(subprocess, 'STARTF_USESHOWWINDOW', 1)
         startupinfo.wShowWindow = getattr(subprocess, 'SW_HIDE', 0)
         creationflags = 0x00000010          # CREATE_NEW_CONSOLE
-    proc = subprocess.Popen([shell], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                            stderr=subprocess.STDOUT, bufsize=0,
-                            close_fds=True,          # never inherit socket handles
-                            startupinfo=startupinfo,
-                            creationflags=creationflags,
-                            env=_shell_child_env())
+    try:
+        proc = subprocess.Popen([shell], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                stderr=subprocess.STDOUT, bufsize=0,
+                                close_fds=True,          # never inherit socket handles
+                                startupinfo=startupinfo,
+                                creationflags=creationflags,
+                                env=_shell_child_env())
+    except OSError as exc:
+        # Without this notice the shell channel just sat there empty.
+        _shell_notice(sock, 'could not start {}: {}'.format(shell, exc))
+        return
 
     send_lock = threading.Lock()
 
