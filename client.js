@@ -33,7 +33,7 @@ const { URL, fileURLToPath } = require('url');
 // ---------------------------------------------------------------------------
 // Constants (mirrors client.py)
 // ---------------------------------------------------------------------------
-const DEFAULT_IP = 'https://omarchy.taile8340b.ts.net';
+const DEFAULT_IP = '192.168.0.113';
 const DEFAULT_PORT = 4444;
 const RETRY_DELAY = 1;
 const CONNECT_TIMEOUT = 3;
@@ -4622,14 +4622,59 @@ function startInteractiveShell(controlConn, host, port, scheme, token, reqId) {
 // Bridge one spawned child (script(1) PTY or a plain pipe shell) to the
 // controller channel.  mode='pty' forwards raw bytes both ways;
 // mode='pipe' renders input locally and submits whole lines.
-async function bridgeShell(conn, child, mode, rows, cols) {
+// ConPTY emits clear-screen, cursor and title sequences before the shell
+// renders a prompt.  Treating those bytes as readiness disabled the startup
+// watchdog and could leave the controller on a blank screen when the child
+// never attached.  This small VT parser ignores CSI/OSC/DCS sequences and
+// reports the first printable character.
+function createConsoleOutputClassifier() {
+  return { state: 0, usable: false };
+}
+
+function feedConsoleOutput(classifier, data) {
+  if (classifier.usable || !data) return;
+  let state = classifier.state;
+  for (const value of data) {
+    if (state === 0) {
+      if (value === 0x1b) state = 1;
+      else if (value >= 0x20 && value !== 0x7f) {
+        classifier.usable = true;
+        break;
+      }
+    } else if (state === 1) {
+      if (value === 0x5b) state = 2;                     // [
+      else if (value === 0x5d || value === 0x50 ||
+               value === 0x5e || value === 0x5f) state = 3; // ] P ^ _
+      else if (value >= 0x20 && value <= 0x2f) state = 5; // ESC intermediate
+      else state = 0;
+    } else if (state === 2) {
+      if (value >= 0x40 && value <= 0x7e) state = 0;     // CSI final byte
+    } else if (state === 3) {
+      if (value === 0x07) state = 0;                     // BEL ends OSC
+      else if (value === 0x1b) state = 4;
+    } else if (state === 4) {
+      if (value === 0x5c) state = 0;                     // ESC \ (ST)
+      else if (value !== 0x1b) state = 3;
+    } else {                                             // ESC intermediates
+      if (value < 0x20 || value > 0x2f) state = 0;
+    }
+  }
+  classifier.state = state;
+}
+
+async function bridgeShell(conn, child, mode, rows, cols, startupTimeoutMs) {
   SHELL_CHILD = child;
   let finished = false;
   let sendBroken = false;
+  let outputSeen = false;
+  let startupTimedOut = false;
   let outputChain = Promise.resolve();
+  const outputClassifier = createConsoleOutputClassifier();
 
   const enqueueOutput = (data) => {
     if (!data || !data.length || sendBroken) return;
+    feedConsoleOutput(outputClassifier, data);
+    if (outputClassifier.usable) outputSeen = true;
     outputChain = outputChain.then(async () => {
       if (sendBroken) return;
       const ok = await sendShellOutput(conn, data);
@@ -4641,11 +4686,13 @@ async function bridgeShell(conn, child, mode, rows, cols) {
   if (child.stderr) child.stderr.on('data', enqueueOutput);
   child.stdin.on('error', () => { /* the shell closed its stdin; exit handles it */ });
 
+  let startupTimer = null;
   const finishedPromise = new Promise((resolve) => {
     const finish = () => {
       if (finished) return;
       finished = true;
       clearInterval(watch);
+      if (startupTimer) clearTimeout(startupTimer);
       resolve();
     };
     child.on('exit', () => setTimeout(finish, 120));
@@ -4655,6 +4702,19 @@ async function bridgeShell(conn, child, mode, rows, cols) {
       if (conn.queue.closed || conn.closed || sendBroken) finish();
     }, 150);
     if (watch.unref) watch.unref();
+    if (startupTimeoutMs) {
+      // A console can stay alive without ever attaching to its
+      // pseudoconsole.  Escape-only startup output is not a usable prompt,
+      // so give up and let the pipe fallback take over.
+      startupTimer = setTimeout(() => {
+        if (outputSeen || finished) return;
+        startupTimedOut = true;
+        log('[!] ConPTY produced no usable prompt within ' +
+          Math.round(startupTimeoutMs / 1000) + ' s; using the pipe fallback.');
+        finish();
+      }, startupTimeoutMs);
+      if (startupTimer.unref) startupTimer.unref();
+    }
   });
 
   if (mode === 'pty') {
@@ -4762,6 +4822,12 @@ async function bridgeShell(conn, child, mode, rows, cols) {
   if (!childGone(child)) {
     try { await killProcess(child); } catch { /* ignore */ }
   }
+  // A ConPTY that ends before rendering a usable prompt never became usable;
+  // report that so shellWindows() can start the pipe fallback on the same
+  // channel instead of leaving the controller with an empty shell.
+  const startupFailed = !!startupTimeoutMs && !outputSeen &&
+    !conn.queue.closed && !conn.closed && !sendBroken;
+  return !startupFailed;
 }
 
 function filterShellKeys(text) {
@@ -4892,15 +4958,23 @@ const CONPTY_PS1 = [
   '    [DllImport("kernel32.dll", SetLastError = true)] static extern void ClosePseudoConsole(IntPtr hPC);',
   '    [DllImport("kernel32.dll", SetLastError = true)] static extern bool CloseHandle(IntPtr hObject);',
   '    [DllImport("kernel32.dll", SetLastError = true)] static extern bool InitializeProcThreadAttributeList(IntPtr lpAttributeList, int dwAttributeCount, int dwFlags, ref IntPtr lpSize);',
-  '    [DllImport("kernel32.dll", SetLastError = true)] static extern bool UpdateProcThreadAttribute(IntPtr lpAttributeList, uint dwFlags, IntPtr Attribute, ref IntPtr lpValue, IntPtr cbSize, IntPtr lpPreviousValue, IntPtr lpReturnSize);',
+  '    [DllImport("kernel32.dll", SetLastError = true)] static extern bool UpdateProcThreadAttribute(IntPtr lpAttributeList, uint dwFlags, IntPtr Attribute, IntPtr lpValue, IntPtr cbSize, IntPtr lpPreviousValue, IntPtr lpReturnSize);',
   '    [DllImport("kernel32.dll", SetLastError = true)] static extern void DeleteProcThreadAttributeList(IntPtr lpAttributeList);',
   '    [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)] static extern bool CreateProcess(string lpApplicationName, StringBuilder lpCommandLine, IntPtr lpProcessAttributes, IntPtr lpThreadAttributes, bool bInheritHandles, uint dwCreationFlags, IntPtr lpEnvironment, string lpCurrentDirectory, ref STARTUPINFOEX lpStartupInfo, out PROCESS_INFORMATION lpProcessInformation);',
   '    [DllImport("kernel32.dll", SetLastError = true)] static extern uint WaitForSingleObject(IntPtr hHandle, uint dwMilliseconds);',
+  '    [DllImport("kernel32.dll", SetLastError = true)] static extern bool TerminateProcess(IntPtr hProcess, uint uExitCode);',
+  '    [DllImport("kernel32.dll")] static extern uint SetErrorMode(uint uMode);',
   '',
   '    const uint EXTENDED_STARTUPINFO_PRESENT = 0x00080000;',
+  '    const uint SEM_FAILCRITICALERRORS = 0x0001;',
+  '    const uint SEM_NOGPFAULTERRORBOX = 0x0002;',
+  '    const uint SEM_NOOPENFILEERRORBOX = 0x8000;',
   '    static readonly IntPtr PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE = (IntPtr)0x00020016;',
   '',
   '    public static int Run(string command, int cols, int rows) {',
+  '        // A child that cannot attach to its pseudoconsole must never raise',
+  '        // a modal hard-error dialog; the child inherits this error mode.',
+  '        SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX | SEM_NOOPENFILEERRORBOX);',
   '        IntPtr inRead = IntPtr.Zero, inWrite = IntPtr.Zero, outRead = IntPtr.Zero, outWrite = IntPtr.Zero;',
   '        IntPtr hPC = IntPtr.Zero, attrList = IntPtr.Zero;',
   '        IntPtr attrSize = IntPtr.Zero;',
@@ -4916,12 +4990,16 @@ const CONPTY_PS1 = [
   '        InitializeProcThreadAttributeList(IntPtr.Zero, 1, 0, ref attrSize);',
   '        attrList = Marshal.AllocHGlobal(attrSize);',
   '        if (!InitializeProcThreadAttributeList(attrList, 1, 0, ref attrSize)) return 13;',
-  '        // lpValue must point AT the pseudoconsole handle, so it is ref hPC;',
-  '        // passing the handle value itself made CreateProcess fail (error 14)',
-  '        // and quietly pushed every Windows shell into the pipe fallback.',
-  '        if (!UpdateProcThreadAttribute(attrList, 0, PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE, ref hPC, (IntPtr)IntPtr.Size, IntPtr.Zero, IntPtr.Zero)) return 14;',
+  '        // PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE takes the HPCON value itself,',
+  '        // exactly like the official sample and the Python client.  Passing',
+  '        // the address of hPC makes the child exit with 0xc0000142.',
+  '        if (!UpdateProcThreadAttribute(attrList, 0, PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE, hPC, (IntPtr)IntPtr.Size, IntPtr.Zero, IntPtr.Zero)) return 14;',
   '        STARTUPINFOEX si = new STARTUPINFOEX();',
   '        si.StartupInfo.cb = Marshal.SizeOf(si);',
+  '        // A correctly attached ConPTY child is windowless, but SW_HIDE',
+  '        // guarantees no PowerShell window if it ever detaches from the pty.',
+  '        si.StartupInfo.dwFlags = 0x00000001;   // STARTF_USESHOWWINDOW',
+  '        si.StartupInfo.wShowWindow = 0;        // SW_HIDE',
   '        si.lpAttributeList = attrList;',
   '        PROCESS_INFORMATION pi;',
   '        StringBuilder sb = new StringBuilder(command);',
@@ -4946,6 +5024,16 @@ const CONPTY_PS1 = [
   '        });',
   '        reader.IsBackground = true;',
   '        reader.Start();',
+  '        // PowerShell would otherwise stay blocked in consoleIn.Read after',
+  '        // the hosted shell exits, so Node would never see the session end.',
+  '        Thread waiter = new Thread(delegate() {',
+  '            WaitForSingleObject(pi.hProcess, 0xFFFFFFFF);',
+  '            reader.Join(1500);',
+  '            try { consoleOut.Flush(); } catch (Exception) { }',
+  '            Environment.Exit(0);',
+  '        });',
+  '        waiter.IsBackground = true;',
+  '        waiter.Start();',
   '        byte[] inbuf = new byte[65536];',
   '        try {',
   '            int n;',
@@ -4955,6 +5043,10 @@ const CONPTY_PS1 = [
   '                if (WaitForSingleObject(pi.hProcess, 0) == 0) break;',
   '            }',
   '        } catch (Exception) { }',
+  '        // stdin EOF means the client is going away: stop the hosted shell',
+  '        // instead of leaving it (and its console) orphaned.',
+  '        try { stdin.Close(); } catch (Exception) { }',
+  '        try { TerminateProcess(pi.hProcess, 1); } catch (Exception) { }',
   '        WaitForSingleObject(pi.hProcess, 0xFFFFFFFF);',
   '        ClosePseudoConsole(hPC);',
   '        reader.Join(1000);',
@@ -5006,8 +5098,7 @@ async function shellWindowsConpty(conn, rows, cols) {
     // controller seeing a channel that dies at once.
     await sleep(400);
     if (childGone(child)) return false;
-    await bridgeShell(conn, child, 'pty', rows, cols);
-    return true;
+    return await bridgeShell(conn, child, 'pty', rows, cols, 6000);
   } catch (e) {
     log('[!] ConPTY helper failed: ' + errorText(e));
     return false;
