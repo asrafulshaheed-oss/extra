@@ -10,7 +10,7 @@ set -euo pipefail
 # ---------- CONFIG (edit these) ----------
 GITHUB_USER="asrafulshaheed-oss"
 GITHUB_REPO="extra"
-BRANCH="main/ror"                       # main / master / tag
+BRANCH="main"                       # main / master / tag
 WORKDIR="$HOME/Downloads/mama"  # where the files land
 FILES=("off.sh" "auto.sh" "client.js")
 # -----------------------------------------
