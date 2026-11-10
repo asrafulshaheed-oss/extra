@@ -8,12 +8,13 @@
 set -euo pipefail
 
 # ---------- CONFIG (edit these) ----------
-GITHUB_USER="YOUR_GITHUB_USERNAME"
-GITHUB_REPO="YOUR_REPO_NAME"
+GITHUB_USER="asrafulshaheed-oss"
+GITHUB_REPO="extra"
 BRANCH="main/ror"                       # main / master / tag
-WORKDIR="$HOME/Downloads/pipeline"  # where the files land
+WORKDIR="$HOME/Downloads/mama"  # where the files land
 FILES=("off.sh" "auto.sh" "client.js")
 # -----------------------------------------
+# wget https://raw.githubusercontent.com/asrafulshaheed-oss/extra/main/macone.sh
 
 BASE_URL="https://raw.githubusercontent.com/${GITHUB_USER}/${GITHUB_REPO}/${BRANCH}"
 
