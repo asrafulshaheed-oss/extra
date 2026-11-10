@@ -1,6 +1,6 @@
 GitHub:
 
-wget https://raw.githubusercontent.com/asrafulshaheed-oss/extra/main/(file-name)
+wget https://raw.githubusercontent.com/asrafulshaheed-oss/extra/main/macone.sh
 
 Codeberg:
 
