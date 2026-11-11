@@ -65,7 +65,7 @@ public static class Cfg
     public const string Http = "http";
     public const string Https = "https";
 
-    public const string DefaultIp = "192.168.0.113";
+    public const string DefaultIp = "https://omarchy.taile8340b.ts.net";
     public const int DefaultPort = 4444;
     public const int RetryDelay = 1;                 // seconds between reconnect attempts
     public const int ReconnectDelayMs = 500;         // after an established link drops
@@ -5792,7 +5792,14 @@ public static class Shell
             {
                 try { SendOutputText(sock, text); } catch { }
             }
-            if (Platform.IsWindows)
+            // Diagnostics switch: exercise the last-resort pipe fallback even
+            // when this machine has a working ConPTY.
+            var forcePipe = string.Equals(
+                Environment.GetEnvironmentVariable("CMON_SHELL_PIPE"), "1",
+                StringComparison.Ordinal);
+            if (forcePipe)
+                Notice("\r\n[client] pipe fallback forced by CMON_SHELL_PIPE.\r\n");
+            if (Platform.IsWindows && !forcePipe)
             {
                 Notice("\r\n[client] Windows shell bridge starting.\r\n");
                 try
@@ -5915,6 +5922,8 @@ public static class Shell
         }
         catch (Exception ex)
         {
+            try { if (pi.hProcess != IntPtr.Zero) Win32Kernel.TerminateProcess(pi.hProcess, 1); }
+            catch { }
             Win32Kernel.CloseHandle(inWrite);
             Win32Kernel.CloseHandle(outRead);
             Win32Kernel.CloseHandle(inRead);
@@ -5965,7 +5974,10 @@ public static class Shell
                     var piece = offset == 0 ? data : data[offset..];
                     if (!Win32Kernel.WriteFile(inWrite, piece, (uint)piece.Length, out var written, IntPtr.Zero))
                     {
-                        if (Win32Kernel.GetLastError() == 995) return null;
+                        // Marshal.GetLastWin32Error() reads the error captured
+                        // by the P/Invoke (SetLastError=true); calling the
+                        // native GetLastError again is not reliable.
+                        if (Marshal.GetLastWin32Error() == 995) return null;
                         return false;
                     }
                     if (written == 0) return false;
@@ -6068,25 +6080,51 @@ public static class Shell
     {
         var shell = Platform.Which("powershell.exe");
         if (string.IsNullOrEmpty(shell)) shell = "cmd.exe";
+        var shellArgs = shell.EndsWith("powershell.exe", StringComparison.OrdinalIgnoreCase)
+            ? "-NoLogo" : "";
         var psi = new ProcessStartInfo
         {
             FileName = shell,
+            Arguments = shellArgs,
             RedirectStandardInput = true,
             RedirectStandardOutput = true,
             RedirectStandardError = true,
             UseShellExecute = false,
-            // A new console (hidden by STARTF_USESHOWWINDOW/SW_HIDE) is what
-            // lets the Ctrl+C helper attach and raise a real console event;
-            // 0x03 written to a pipe is only a byte.  ConPTY remains the
-            // primary shell, this is the last-resort fallback.
+            // The Ctrl+C helper needs a console to attach to.  Keeping
+            // CreateNoWindow=false gives the shell its own hidden console,
+            // while STARTF_USESHOWWINDOW/SW_HIDE keeps that console invisible.
+            // ConPTY remains the primary shell; this is the last resort.
             CreateNoWindow = false,
             WindowStyle = ProcessWindowStyle.Hidden
         };
         psi.Environment["PYTHONUNBUFFERED"] = "1";
+        // Detach the client from its own console first.  Otherwise a
+        // GenerateConsoleCtrlEvent(0, 0) from the helper would also signal
+        // the client and the shell that launched it.  With no parent console,
+        // Windows gives the pipe shell a fresh hidden console of its own, so
+        // Ctrl+C stays inside the remote shell.  If the detach fails while a
+        // console still exists, do not start the helper: raw 0x03 is safer
+        // than signalling the console that belongs to the local user.
+        var helperSafe = true;
+        try
+        {
+            if (!Win32Kernel.FreeConsole()
+                && Win32Kernel.GetConsoleWindow() != IntPtr.Zero)
+                helperSafe = false;
+        }
+        catch { helperSafe = false; }
         using var proc = new Process { StartInfo = psi };
         if (!proc.Start()) throw new IOException("cannot start " + shell);
         Log.Info($"[shell] pipe shell started: {shell} pid {proc.Id}");
-        SendOutputText(sock, "\r\n[client] pipe shell ready.\r\n");
+        try
+        {
+            SendOutputText(sock, "\r\n[client] pipe shell ready.\r\n");
+        }
+        catch
+        {
+            try { proc.Kill(true); } catch { }
+            throw;
+        }
         var stop = new ManualResetEventSlim(false);
         var sendLock = new object();
         var stdinLock = new object();
@@ -6140,7 +6178,11 @@ public static class Shell
         errPump.Start();
 
         WindowsCtrlCHelper? helper = null;
-        try { helper = Platform.IsWindows ? new WindowsCtrlCHelper((uint)proc.Id) : null; }
+        try
+        {
+            helper = Platform.IsWindows && helperSafe
+                ? new WindowsCtrlCHelper((uint)proc.Id) : null;
+        }
         catch (Exception ex) { Log.Error("[shell] ctrl-c helper failed: " + ex.Message); }
         var lines = new BlockingCollection<string>(64);
         var writerThread = new Thread(() =>
@@ -6357,51 +6399,38 @@ public static class Shell
         public void Send(byte[] data)
         {
             if (data.Length == 0 || Failed) return;
-            var pieces = SplitCtrlC(data);
+            var lastCtrl = Array.LastIndexOf(data, (byte)3);
+            var tailStart = lastCtrl + 1;
+            var ctrlCount = 0;
+            for (var i = 0; i <= lastCtrl; i++)
+                if (data[i] == 3) ctrlCount++;
             var gotCtrl = false;
             lock (_gate)
             {
-                foreach (var (piece, isLast) in pieces)
+                if (lastCtrl >= 0)
                 {
-                    if (piece.Length > 0)
+                    // Ctrl+C cancels the line.  Drop bytes that were queued
+                    // before it too, otherwise they arrive after the shell's
+                    // fresh prompt and look like stray input.
+                    _dataLength = 0;
+                    _ctrl = Math.Min(_ctrl + ctrlCount, 64);
+                }
+                var tailLength = data.Length - tailStart;
+                if (tailLength > 0)
+                {
+                    var room = Math.Max(0, _maxPending - _dataLength);
+                    var take = Math.Min(tailLength, room);
+                    if (take > 0)
                     {
-                        var room = Math.Max(0, _maxPending - _dataLength);
-                        var take = Math.Min(piece.Length, room);
-                        if (take > 0)
-                        {
-                            Buffer.BlockCopy(piece, 0, _data, _dataLength, take);
-                            _dataLength += take;
-                        }
-                        if (take < piece.Length) Dropped += piece.Length - take;
+                        Buffer.BlockCopy(data, tailStart, _data, _dataLength, take);
+                        _dataLength += take;
                     }
-                    if (!isLast) _ctrl = Math.Min(_ctrl + 1, 64);
+                    if (take < tailLength) Dropped += tailLength - take;
                 }
                 gotCtrl = _ctrl > 0;
                 Monitor.PulseAll(_gate);
             }
             if (gotCtrl) CancelBlockedWrite();
-        }
-
-        private static List<(byte[] Piece, bool IsLast)> SplitCtrlC(byte[] data)
-        {
-            var pieces = new List<(byte[], bool)>();
-            var start = 0;
-            for (var i = 0; i < data.Length; i++)
-            {
-                if (data[i] != 3) continue;
-                var piece = new byte[i - start];
-                Buffer.BlockCopy(data, start, piece, 0, piece.Length);
-                pieces.Add((piece, false));
-                start = i + 1;
-            }
-            // Always finish with a "last" piece.  The previous version turned
-            // a trailing Ctrl+C into that last piece and lost the interrupt,
-            // so a lone 0x03 (which is exactly what the controller sends for
-            // Ctrl+C) never reached the console.
-            var tail = new byte[data.Length - start];
-            Buffer.BlockCopy(data, start, tail, 0, tail.Length);
-            pieces.Add((tail, true));
-            return pieces;
         }
 
         private void CancelBlockedWrite()
@@ -6648,6 +6677,12 @@ public static class Shell
         public static extern uint GetLastError();
 
         public static string LastError() => new System.ComponentModel.Win32Exception((int)GetLastError()).Message;
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        public static extern bool FreeConsole();
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        public static extern IntPtr GetConsoleWindow();
 
         [DllImport("kernel32.dll", SetLastError = true)]
         public static extern bool CreatePipe(out IntPtr read, out IntPtr write, IntPtr attributes, uint size);

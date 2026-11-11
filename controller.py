@@ -4525,8 +4525,8 @@ class _ShellInputWriter(object):
     A blocked/proxied tunnel send must never freeze the controller's keyboard
     loop: while a write is stalled the user must still be able to press Ctrl+]
     (or keep seeing client output).  The bounded buffer also stops a huge
-    paste from exhausting memory; Ctrl+C jumps ahead of queued paste so an
-    interrupt is not stuck behind a megabyte of typed text.
+    paste from exhausting memory; Ctrl+C cancels queued input and jumps
+    ahead of a paste, so an interrupt is not stuck behind typed text.
 
     Sends are bounded: a raw socket has SO_SNDTIMEO set by
     _tune_link_socket(), and this thread additionally gives up when no byte
@@ -4551,19 +4551,23 @@ class _ShellInputWriter(object):
     def send(self, data):
         if not data or self.failed.is_set():
             return
-        pieces = data.split(b'\x03')
+        last_ctrl = data.rfind(b'\x03')
         with self._cond:
-            for index, piece in enumerate(pieces):
-                if piece:
-                    room = max(0, self.MAX_PENDING - self._pending)
-                    take = min(len(piece), room)
-                    if take:
-                        self._parts.append(piece[:take])
-                        self._pending += take
-                    if take < len(piece):
-                        self.dropped += len(piece) - take
-                if index != len(pieces) - 1:
-                    self._ctrl = min(self._ctrl + 1, 64)
+            if last_ctrl >= 0:
+                # Ctrl+C cancels the line; discard paste that was queued
+                # before it so old characters do not trail the fresh prompt.
+                self._parts.clear()
+                self._pending = 0
+                self._ctrl = min(self._ctrl + data.count(b'\x03'), 64)
+                data = data[last_ctrl + 1:]
+            if data:
+                room = max(0, self.MAX_PENDING - self._pending)
+                take = min(len(data), room)
+                if take:
+                    self._parts.append(data[:take])
+                    self._pending += take
+                if take < len(data):
+                    self.dropped += len(data) - take
             self._cond.notify()
 
     def _send_all(self, data):
@@ -4672,7 +4676,10 @@ PTY normally erases with 0x7f, a Windows console with 0x08."""
                     print("\n[+] Shell session closed (Ctrl+]).")
                     break
                 if client_os == 'windows':
-                    data = data.replace(b'\x7f', _shell_backspace_byte('windows'))
+                    # Also collapse CRLF and lone LF: a Unix paste can carry
+                    # either, and two line endings would submit an extra empty
+                    # command to the Windows console.
+                    data = _shell_windows_stdin_bytes(data, client_os)
                 elif client_os:
                     data = data.replace(b'\x08', _shell_backspace_byte(client_os))
                 writer.send(data)

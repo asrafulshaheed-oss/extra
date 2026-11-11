@@ -51,7 +51,7 @@ http = 'http'
 https = 'https'
 connection_type = auto         # <- auto / https / http / tcp
 
-DEFAULT_IP = '192.168.0.113'
+DEFAULT_IP = 'https://omarchy.taile8340b.ts.net'
 DEFAULT_PORT = 4444
 RETRY_DELAY = 1               # seconds between reconnect attempts
 CONNECT_TIMEOUT = 3           # seconds a TCP connect may take before we retry
@@ -138,9 +138,17 @@ def _silence_console():
             except OSError:
                 pass
     # Keep the TextIOWrapper objects coherent for any later .flush() call.
+    # pythonw.exe can start with sys.stdout/sys.stderr set to None; give
+    # them a writable null stream so a diagnostic print in the shell fallback
+    # can never abort the fallback chain.
     for name in ('stdout', 'stderr'):
         try:
-            getattr(sys, name).flush()
+            stream = getattr(sys, name)
+            if stream is None:
+                setattr(sys, name, open(os.devnull, 'w',
+                                        encoding='utf-8', errors='replace'))
+            else:
+                stream.flush()
         except Exception:
             pass
 
@@ -3533,9 +3541,10 @@ class _WindowsInputWriter(object):
     WriteFile to a ConPTY input pipe is synchronous.  A program that stops
     reading (or a huge paste that fills the console input buffer) could park
     the old socket-reader thread forever, which also stopped Ctrl+C from being
-    seen.  All input now goes through this daemon thread.  Ctrl+C jumps ahead
-    of queued paste, and CancelSynchronousIo frees a blocked WriteFile so the
-    interrupt is delivered immediately instead of after the paste drains.
+    seen.  All input now goes through this daemon thread.  Ctrl+C cancels
+    queued input and jumps ahead of a paste, and CancelSynchronousIo frees a
+    blocked WriteFile so the interrupt is delivered immediately instead of
+    after the paste drains.
     """
 
     def __init__(self, write_chunk, ctrl_c, max_pending=4 * 1024 * 1024):
@@ -3555,20 +3564,20 @@ class _WindowsInputWriter(object):
     def send(self, data):
         if not data or self.failed.is_set():
             return
-        pieces = data.split(b'\x03')
+        last_ctrl = data.rfind(b'\x03')
         with self._cond:
-            for index, piece in enumerate(pieces):
-                if piece:
-                    room = max(0, self._max_pending - len(self._data))
-                    take = min(len(piece), room)
-                    if take:
-                        self._data += piece[:take]
-                    if take < len(piece):
-                        # Only the bytes that did not fit were dropped; the
-                        # old arithmetic also counted bytes that were queued.
-                        self.dropped += len(piece) - take
-                if index != len(pieces) - 1:
-                    self._ctrl = min(self._ctrl + 1, 64)
+            if last_ctrl >= 0:
+                # Ctrl+C cancels the line.  Drop bytes still queued before
+                # it, otherwise they arrive after the shell's fresh prompt.
+                self._data.clear()
+                self._ctrl = min(self._ctrl + data.count(b'\x03'), 64)
+                data = data[last_ctrl + 1:]
+            room = max(0, self._max_pending - len(self._data))
+            take = min(len(data), room)
+            if take:
+                self._data += data[:take]
+            if take < len(data):
+                self.dropped += len(data) - take
             has_ctrl = self._ctrl > 0
             self._cond.notify()
         # Free a WriteFile parked in a full console buffer even when the
@@ -3773,6 +3782,8 @@ def _shell_windows_conpty(sock, rows, cols):
     k32.WriteFile.restype = BOOL
     k32.TerminateProcess.argtypes = [HANDLE, ctypes.c_uint]
     k32.TerminateProcess.restype = BOOL
+    k32.GetExitCodeProcess.argtypes = [HANDLE, ctypes.POINTER(DWORD)]
+    k32.GetExitCodeProcess.restype = BOOL
     k32.WaitForSingleObject.argtypes = [HANDLE, DWORD]
     k32.WaitForSingleObject.restype = DWORD
     k32.CloseHandle.argtypes = [HANDLE]
@@ -3891,6 +3902,13 @@ def _shell_windows_conpty(sock, rows, cols):
         _shell_notice(sock, 'ConPTY child started (pid {}).'.format(
             pi.dwProcessId))
     except Exception as exc:
+        # If CreateProcess succeeded but a later setup/notice step failed,
+        # do not leave an orphan shell behind the closed pseudoconsole.
+        try:
+            if pi.hProcess:
+                k32.TerminateProcess(pi.hProcess, 1)
+        except Exception:
+            pass
         close(in_write)
         close(out_read)
         close(in_read)
@@ -3957,6 +3975,7 @@ def _shell_windows_conpty(sock, rows, cols):
     writer = None
     startup_failed = False
     controller_closed = False
+    exit_code = DWORD(0)
     reader_thread = threading.Thread(target=reader, name='conpty-reader',
                                      daemon=True)
     reader_thread.start()
@@ -3989,6 +4008,12 @@ def _shell_windows_conpty(sock, rows, cols):
                 if k32.WaitForSingleObject(pi.hProcess, 0) == 0:
                     time.sleep(0.08)
                     stop.set()
+                    try:
+                        if not k32.GetExitCodeProcess(
+                                pi.hProcess, ctypes.byref(exit_code)):
+                            exit_code.value = 0
+                    except Exception:
+                        pass
                     if not output_usable[0]:
                         startup_failed = True
                     break
@@ -4041,6 +4066,12 @@ def _shell_windows_conpty(sock, rows, cols):
         except Exception:
             pass
         try:
+            # If the reader closed first, the process may already be gone.
+            # Capture its real status before TerminateProcess overwrites it.
+            k32.GetExitCodeProcess(pi.hProcess, ctypes.byref(exit_code))
+        except Exception:
+            pass
+        try:
             k32.TerminateProcess(pi.hProcess, 1)
         except Exception:
             pass
@@ -4065,11 +4096,22 @@ def _shell_windows_conpty(sock, rows, cols):
                 k32.DeleteProcThreadAttributeList(ctypes.cast(attr_buf, LPVOID))
             except Exception:
                 pass
+    # A child that dies with STATUS_DLL_INIT_FAILED never attached to its
+    # pseudoconsole, even if it managed to print an error first.  Do not
+    # start a fallback shell for a controller that has already disconnected.
+    if not controller_closed and exit_code.value == 0xC0000142:
+        startup_failed = True
     return not startup_failed
 
 
 def _shell_windows(sock, rows, cols):
     """Bridge a PowerShell/cmd console to the controller's socket."""
+    # Diagnostics switch: exercise the last-resort pipe fallback even when
+    # this machine has a working ConPTY.
+    if os.name == 'nt' and os.environ.get('CMON_SHELL_PIPE') == '1':
+        _shell_notice(sock, 'pipe fallback forced by CMON_SHELL_PIPE.')
+        _shell_windows_pipes(sock)
+        return
     # Prefer the built-in ConPTY bridge: it is a real terminal, so cmd.exe
     # echoes typed characters and live output is not hidden in a pipe buffer.
     if os.name == 'nt':
@@ -4097,6 +4139,16 @@ def _shell_windows(sock, rows, cols):
         return
 
     shell = 'powershell.exe' if shutil.which('powershell.exe') else 'cmd.exe'
+    # Same hidden-client rule as the pipe fallback: a shell that cannot
+    # initialize must not raise a modal hard-error dialog.
+    old_error_mode = None
+    k32 = None
+    try:
+        import ctypes
+        k32 = ctypes.windll.kernel32
+        old_error_mode = k32.SetErrorMode(0x0001 | 0x0002 | 0x8000)
+    except Exception:
+        k32 = None
     try:
         try:
             pty = winpty.PtyProcess.spawn(shell, dimensions=(rows, cols),
@@ -4113,6 +4165,12 @@ def _shell_windows(sock, rows, cols):
                             'fallback (line input, local echo).'.format(reason))
         _shell_windows_pipes(sock)
         return
+    finally:
+        if old_error_mode is not None:
+            try:
+                k32.SetErrorMode(old_error_mode)
+            except Exception:
+                pass
 
     stop = threading.Event()
 
@@ -4226,6 +4284,20 @@ def _filter_shell_keys(text):
     return ''.join(out), ''
 
 
+def _kill_windows_process_tree(pid):
+    """Best effort: do not leave child programs behind after a forced close."""
+    if os.name != 'nt':
+        return
+    try:
+        subprocess.run(
+            ['taskkill', '/F', '/T', '/PID', str(pid)],
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL, timeout=2,
+            creationflags=CREATE_NO_WINDOW)
+    except Exception:
+        pass
+
+
 def _shell_windows_pipes(sock):
     """Line-oriented last-resort fallback when no Windows PTY exists.
 
@@ -4238,6 +4310,7 @@ def _shell_windows_pipes(sock):
     session usable on locked-down systems where both are unavailable.
     """
     shell = 'powershell.exe' if shutil.which('powershell.exe') else 'cmd.exe'
+    args = ['-NoLogo'] if shell.lower().endswith('powershell.exe') else []
     # A real hidden console is required for Ctrl+C: 0x03 written to a pipe is
     # just a byte.  CREATE_NEW_CONSOLE gives the helper a console to attach to
     # for GenerateConsoleCtrlEvent, while STARTF_USESHOWWINDOW/SW_HIDE keeps
@@ -4249,8 +4322,20 @@ def _shell_windows_pipes(sock):
         startupinfo.dwFlags |= getattr(subprocess, 'STARTF_USESHOWWINDOW', 1)
         startupinfo.wShowWindow = getattr(subprocess, 'SW_HIDE', 0)
         creationflags = 0x00000010          # CREATE_NEW_CONSOLE
+    # A pipe-fallback child that cannot initialize must not raise a modal
+    # hard-error dialog on a hidden Windows client.  The mode is inherited at
+    # CreateProcess time, so it can be restored immediately afterwards.
+    old_error_mode = None
+    k32 = None
+    if os.name == 'nt':
+        try:
+            import ctypes
+            k32 = ctypes.windll.kernel32
+            old_error_mode = k32.SetErrorMode(0x0001 | 0x0002 | 0x8000)
+        except Exception:
+            k32 = None
     try:
-        proc = subprocess.Popen([shell], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+        proc = subprocess.Popen([shell] + args, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                 stderr=subprocess.STDOUT, bufsize=0,
                                 close_fds=True,          # never inherit socket handles
                                 startupinfo=startupinfo,
@@ -4260,6 +4345,12 @@ def _shell_windows_pipes(sock):
         # Without this notice the shell channel just sat there empty.
         _shell_notice(sock, 'could not start {}: {}'.format(shell, exc))
         return
+    finally:
+        if old_error_mode is not None:
+            try:
+                k32.SetErrorMode(old_error_mode)
+            except Exception:
+                pass
 
     _shell_notice(sock, 'pipe shell ready (line input, local echo).')
 
@@ -4387,6 +4478,11 @@ def _shell_windows_pipes(sock):
         stop.set()
         try:
             helper.close()
+        except Exception:
+            pass
+        try:
+            if proc.poll() is None:
+                _kill_windows_process_tree(proc.pid)
         except Exception:
             pass
         try:
